@@ -56,48 +56,50 @@ Migrate **1,500 Pentaho jobs/transformations** (.kjb/.ktr) to a Java-based engin
 ## 3. High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                   API / Trigger Layer (WebFlux)                   │
-│  REST endpoints, Scheduler/Cron, Kafka consumers, File watch     │
-└──────────────────────────┬──────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                    API / Trigger Layer (WebFlux)                      │
+│  REST endpoints, Scheduler/Cron, Kafka consumers, File watch         │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ triggers
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│              1 Common DAG Executor  ← REACTOR (Mono)                 │
+│                                                                      │
+│  Takes any JobDefinition (graph of steps + hops)                     │
+│  Chains steps via .flatMap() / Mono.zip() / .onErrorResume()         │
+│  Handles: sequencing, parallelism, conditionals, error routing       │
+│  Retry, timeout, logging — all built into the common engine          │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ invokes
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│         85 Step Components  ← @FunctionalInterface → Mono<StepResult>│
+│                                                                      │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
+│  │ SqlQuery │ │ RestCall │ │ SftpGet  │ │ MailSend │ │ RunTrans │  │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └─────┬────┘  │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐       │       │
+│  │ ShellCmd │ │ KafkaPub │ │ FileCopy │ │ RunJob   │       │       │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘       │       │
+│  ... (85 total, all reusable across 1,500 jobs)             │       │
+└─────────────────────────────────────────────────────────────┼───────┘
+                                                              │ bridge
+                                                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│             Transformation Engine  ← PLAIN JAVA (Iterator)           │
+│                                                                      │
+│  Iterator<DataRow> pipeline: read → map → filter → sort → write      │
+│  Simple, debuggable, no reactive types                               │
+└─────────────────────────────────────────────────────────────────────┘
                            │
                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│          Job Orchestrator Engine  ← REACTOR (Mono/Flux)          │
-│                                                                  │
-│  JobDefinition ──► builds Mono<JobResult> chain from step graph  │
-│  Handles: sequencing, parallelism, conditionals, error routing   │
-│                                                                  │
-│  step1.execute(ctx)                                              │
-│    .flatMap(r -> Mono.zip(step2a.execute(r), step2b.execute(r))) │
-│    .flatMap(r -> step3.execute(r))                               │
-│    .onErrorResume(e -> errorStep.execute(ctx))                   │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│ Step: DB     │ │ Step: REST   │ │ Step: Run    │
-│ (Mono-based) │ │ (WebClient)  │ │ Transformation│
-└──────┬───────┘ └──────┬───────┘ └──────┬───────┘
-       │                │                │
-       │                │                ▼
-       │                │   ┌─────────────────────────────────┐
-       │                │   │  Transformation Engine           │
-       │                │   │  ← PLAIN JAVA (Stream/Iterator)  │
-       │                │   │                                   │
-       │                │   │  Iterator<DataRow> pipeline:      │
-       │                │   │  read → map → filter → sort       │
-       │                │   │  → group → write                  │
-       │                │   │                                   │
-       │                │   │  Simple, debuggable, no reactive  │
-       │                │   └──────────┬────────────────────────┘
-       │                │              │
-       ▼                ▼              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Connector Layer                               │
-│  JDBC / BufferedReader / BufferedWriter / WebClient / SFTP / S3 │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Connector Layer                                │
+│  JDBC / BufferedReader / BufferedWriter / WebClient / SFTP / S3      │
+└─────────────────────────────────────────────────────────────────────┘
+
+1,500 Job Definitions (auto-generated) feed into the DAG Executor.
+Each is pure data: which steps to use + how they're wired (hops).
 ```
 
 ---
@@ -112,25 +114,41 @@ pentaho-to-java/
 │   ├── code-generator/                  # IR → Java source code generation
 │   └── validation/                      # Validates generated code vs original
 │
-├── orchestration-engine/                # Job orchestration — REACTOR (Mono)
+├── dag-executor/                        # Common DAG engine — REACTOR (Mono)
 │   ├── core/                            # Core abstractions
-│   │   ├── model/                       # JobDefinition, StepDefinition
-│   │   ├── engine/                      # JobOrchestrator, StepExecutor SPI
+│   │   ├── model/                       # JobDefinition, JobGraph, HopType
+│   │   ├── engine/                      # DagExecutor (walks graph, chains Monos)
 │   │   ├── context/                     # JobContext, variable resolution
-│   │   └── error/                       # Error handling, retry policies
+│   │   └── error/                       # Error handling, retry, timeout policies
 │   │
-│   ├── steps/                           # Built-in job step implementations (Mono-based)
-│   │   ├── db/                          # SQL execute, stored proc calls
-│   │   ├── rest/                        # WebClient HTTP calls
-│   │   ├── flow/                        # Switch/Case, Abort, Dummy, sub-job
-│   │   ├── messaging/                   # Kafka produce/consume, JMS
-│   │   ├── shell/                       # Shell command execution
-│   │   ├── mail/                        # Email notifications
-│   │   └── transform/                   # RunTransformation step (bridge to plain Java)
+│   └── observability/                   # Monitoring & tracing (orchestration)
+│       ├── metrics/                     # Micrometer (step duration, success/fail)
+│       ├── tracing/                     # OpenTelemetry spans per step
+│       └── logging/                     # Structured logging per step execution
+│
+├── step-components/                     # 85 reusable step components (@FunctionalInterface)
+│   ├── spi/                             # StepExecutor interface + StepResult
+│   ├── db/                              # SqlQueryStep, SqlExecuteStep, StoredProcStep (~12)
+│   ├── file/                            # FileCopy, FileDelete, FileExists, FileMove (~8)
+│   ├── file-transfer/                   # SftpGet, SftpPut, FtpGet, S3Upload (~8)
+│   ├── rest/                            # HttpGetStep, HttpPostStep, RestCallStep (~5)
+│   ├── messaging/                       # KafkaProduceStep, KafkaConsumeStep, JmsSend (~5)
+│   ├── shell/                           # ShellCommandStep, SshExecStep (~3)
+│   ├── mail/                            # MailStep, SlackStep (~4)
+│   ├── flow/                            # StartStep, SuccessStep, AbortStep, DummyStep (~8)
+│   ├── orchestration/                   # RunJobStep (sub-job), WaitForFile, Delay (~5)
+│   ├── transform/                       # RunTransformationStep (bridge to plain Java) (~1)
+│   ├── validation/                      # CheckDbConnection, TableExists, FileExists (~5)
+│   ├── variable/                        # SetVariable, EvalCondition, WriteToLog (~5)
+│   └── scripting/                       # GroovyScriptStep (escape hatch) (~1)
+│   │                                    # Total: ~85 step components
 │   │
-│   └── connectors/                      # Async connection management
+│   └── connectors/                      # Shared connection management
 │       ├── webclient/                   # Spring WebClient (REST)
-│       └── kafka/                       # Reactor Kafka
+│       ├── jdbc/                        # JDBC DataSource pool
+│       ├── sftp/                        # JSch / Apache SSHD
+│       ├── kafka/                       # Reactor Kafka
+│       └── s3/                          # AWS SDK
 │
 ├── transformation-engine/               # Data transformation — PLAIN JAVA
 │   ├── core/                            # Core abstractions
@@ -178,23 +196,15 @@ pentaho-to-java/
 
 ## 5. Core Abstractions (Design)
 
-### 5.1 DataRow
+### 5.1 StepExecutor — The Functional Interface (85 components implement this)
 
 ```java
-public interface DataRow {
-    Object get(String field);
-    DataRow with(String field, Object value);
-    DataRow without(String field);
-    Map<String, Object> toMap();
-    Set<String> fieldNames();
-}
-```
-
-### 5.2 StepExecutor — Reactor (for orchestration job entries)
-
-```java
+/**
+ * Every one of the 85 step components implements this single interface.
+ * It is the only contract between the DAG executor and the step components.
+ */
+@FunctionalInterface
 public interface StepExecutor {
-    /** Execute one step in a job. Returns Mono for async composition. */
     Mono<StepResult> execute(JobContext context);
 }
 
@@ -202,53 +212,245 @@ public record StepResult(
     StepStatus status,       // SUCCESS, FAILURE, SKIPPED
     JobContext context,       // Potentially enriched context
     Map<String, Object> outputs
-) {}
-```
-
-### 5.3 RowTransformer — Plain Java (for transformation steps)
-
-```java
-public interface RowTransformer {
-    /**
-     * Transform rows. Plain Java — no Reactor types.
-     * Accepts and returns Iterator for lazy, memory-efficient streaming.
-     */
-    Iterator<DataRow> apply(Iterator<DataRow> input, TransformContext context);
-}
-```
-
-### 5.4 JobOrchestrator — Reactor (builds Mono chain from job graph)
-
-```java
-public class JobOrchestrator {
-
-    public Mono<JobResult> execute(JobDefinition job, JobContext context) {
-        // Walks the step graph in topological order
-        // Builds a Mono chain: step1.then(step2).then(parallel(step3, step4)).then(step5)
-        // Wires error hops to onErrorResume
-        // Returns final Mono<JobResult>
+) {
+    public static StepResult success(JobContext ctx) {
+        return new StepResult(StepStatus.SUCCESS, ctx, Map.of());
+    }
+    public static StepResult failure(JobContext ctx, String reason) {
+        return new StepResult(StepStatus.FAILURE, ctx, Map.of("error", reason));
     }
 }
 ```
 
-### 5.5 TransformationPipeline — Plain Java (builds Iterator chain)
+### 5.2 JobDefinition + JobGraph — Pure Data (1,500 auto-generated)
+
+```java
+/**
+ * Each .kjb becomes one JobDefinition. It declares WHAT steps to run and
+ * HOW they're wired — no execution logic. The DAG executor handles the rest.
+ */
+public interface JobDefinition {
+    JobGraph define(JobContext ctx);
+}
+
+public class JobGraph {
+    private final Map<String, StepExecutor> steps;   // step ID → executor
+    private final List<Hop> hops;                     // directed edges
+
+    public record Hop(String from, String to, HopType type) {}
+    public enum HopType { OK, ERROR, UNCONDITIONAL }
+
+    /** Returns steps grouped by topological level (for parallelism detection) */
+    public List<List<String>> topologicalLevels() { ... }
+
+    /** Returns hop targets for a given step and hop type */
+    public List<String> getHops(String stepId, HopType type) { ... }
+
+    public static Builder builder() { return new Builder(); }
+}
+```
+
+### 5.3 DagExecutor — The Common Engine (ONE, shared by all 1,500 jobs)
+
+```java
+/**
+ * Common DAG executor. Walks ANY JobGraph and chains steps using Mono.
+ * Never changes per job — all 1,500 jobs run through this one engine.
+ */
+public class DagExecutor {
+
+    public Mono<JobResult> execute(JobDefinition job, JobContext ctx) {
+        JobGraph graph = job.define(ctx);
+        return executeFromStep(graph, graph.startStep(), ctx)
+                .map(r -> new JobResult(r.status()));
+    }
+
+    private Mono<StepResult> executeFromStep(JobGraph graph, String stepId, JobContext ctx) {
+        StepExecutor step = graph.getStep(stepId);
+
+        return step.execute(ctx)                                 // run this step
+            .doOnSubscribe(s -> log.info("Starting step: {}", stepId))
+            .doOnSuccess(r -> log.info("Step {} → {}", stepId, r.status()))
+            .timeout(graph.getTimeout(stepId))                   // per-step timeout
+            .retry(graph.getRetryCount(stepId))                  // per-step retry
+            .flatMap(result -> {
+                if (result.status() == SUCCESS) {
+                    return followHops(graph, stepId, HopType.OK, result.context());
+                } else {
+                    return followHops(graph, stepId, HopType.ERROR, result.context());
+                }
+            })
+            .onErrorResume(e ->                                  // exception → error hop
+                followHops(graph, stepId, HopType.ERROR, ctx.with("error", e.getMessage()))
+            );
+    }
+
+    private Mono<StepResult> followHops(JobGraph graph, String stepId,
+                                         HopType type, JobContext ctx) {
+        List<String> nextSteps = graph.getHops(stepId, type);
+
+        if (nextSteps.isEmpty()) {
+            return Mono.just(StepResult.success(ctx));           // end of chain
+        }
+        if (nextSteps.size() == 1) {
+            return executeFromStep(graph, nextSteps.get(0), ctx); // sequential
+        }
+
+        // Parallel fan-out → Mono.zip
+        List<Mono<StepResult>> parallel = nextSteps.stream()
+            .map(next -> executeFromStep(graph, next, ctx))
+            .toList();
+        return Mono.zip(parallel, results -> mergeResults(results, ctx));
+    }
+}
+```
+
+### 5.4 Example Step Components (of the 85)
+
+```java
+// ── Database ──────────────────────────────────────────────────────
+@Component
+public class SqlQueryStep implements StepExecutor {
+    private final DataSource dataSource;
+
+    @Override
+    public Mono<StepResult> execute(JobContext ctx) {
+        return Mono.fromCallable(() -> {
+            try (var conn = dataSource.getConnection();
+                 var stmt = conn.prepareStatement(ctx.param("query"))) {
+                stmt.execute();
+                return StepResult.success(ctx.with("rowCount", stmt.getUpdateCount()));
+            }
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+}
+
+// ── REST Call (natively non-blocking) ────────────────────────────
+@Component
+public class HttpPostStep implements StepExecutor {
+    private final WebClient webClient;
+
+    @Override
+    public Mono<StepResult> execute(JobContext ctx) {
+        return webClient.post()
+            .uri(ctx.param("url"))
+            .bodyValue(ctx.param("payload"))
+            .retrieve()
+            .bodyToMono(String.class)
+            .map(resp -> StepResult.success(ctx.with("response", resp)));
+    }
+}
+
+// ── Shell Command ────────────────────────────────────────────────
+@Component
+public class ShellCommandStep implements StepExecutor {
+
+    @Override
+    public Mono<StepResult> execute(JobContext ctx) {
+        return Mono.fromCallable(() -> {
+            Process p = new ProcessBuilder("bash", "-c", ctx.param("command")).start();
+            int exitCode = p.waitFor();
+            return exitCode == 0
+                ? StepResult.success(ctx)
+                : StepResult.failure(ctx, "Exit code: " + exitCode);
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+}
+
+// ── Run Transformation (bridge to plain Java) ────────────────────
+@Component
+public class RunTransformationStep implements StepExecutor {
+    private final TransformationPipeline pipeline;
+
+    @Override
+    public Mono<StepResult> execute(JobContext ctx) {
+        return Mono.fromCallable(() -> {
+            pipeline.execute(ctx.param("transformDef"), ctx.toTransformContext());
+            return StepResult.success(ctx);
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+}
+
+// ── Mail ──────────────────────────────────────────────────────────
+@Component
+public class MailStep implements StepExecutor {
+    private final JavaMailSender mailSender;
+
+    @Override
+    public Mono<StepResult> execute(JobContext ctx) {
+        return Mono.fromCallable(() -> {
+            mailSender.send(buildMessage(ctx));
+            return StepResult.success(ctx);
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+}
+```
+
+### 5.5 What Gets Auto-Generated Per .kjb (Pure Data)
+
+```java
+/**
+ * Auto-generated from: customer_daily_load.kjb
+ * This class is ONLY data — no execution logic.
+ * The DagExecutor runs it.
+ */
+@Component
+public class CustomerDailyLoadJob implements JobDefinition {
+
+    @Autowired SqlQueryStep sqlQuery;
+    @Autowired RunTransformationStep runTransform;
+    @Autowired SqlExecuteStep sqlExecute;
+    @Autowired MailStep mail;
+
+    @Override
+    public JobGraph define(JobContext ctx) {
+        return JobGraph.builder()
+            .step("start",     Steps.start())
+            .step("extract",   sqlQuery.with(ctx.param("source_query")))
+            .step("transform", runTransform.with("customer_transform_v2"))
+            .step("load",      sqlExecute.with(ctx.param("insert_query")))
+            .step("notify",    mail.with(ctx.param("success_email")))
+            .step("onError",   mail.with(ctx.param("error_email")))
+
+            .hop("start",     "extract",   UNCONDITIONAL)
+            .hop("extract",   "transform", OK)
+            .hop("transform", "load",      OK)
+            .hop("load",      "notify",    OK)
+            .hop("extract",   "onError",   ERROR)
+            .hop("transform", "onError",   ERROR)
+            .hop("load",      "onError",   ERROR)
+            .build();
+    }
+}
+```
+
+### 5.6 DataRow (for Transformation Engine)
+
+```java
+public interface DataRow {
+    Object get(String field);
+    long getByteOffset();                  // for IndexSortOperator
+    DataRow with(String field, Object value);
+    DataRow without(String field);
+    Map<String, Object> toMap();
+    Set<String> fieldNames();
+}
+```
+
+### 5.7 RowTransformer — Plain Java (for transformation steps)
+
+```java
+public interface RowTransformer {
+    Iterator<DataRow> apply(Iterator<DataRow> input, TransformContext context);
+}
+```
+
+### 5.8 TransformationPipeline — Plain Java (builds Iterator chain)
 
 ```java
 public class TransformationPipeline {
 
-    /**
-     * Executes a transformation as a plain Java Iterator pipeline.
-     * No reactive types — simple, debuggable, standard Java.
-     *
-     * Called from orchestration layer via:
-     *   Mono.fromCallable(() -> pipeline.execute(def, ctx))
-     *       .subscribeOn(Schedulers.boundedElastic())
-     */
     public TransformResult execute(TransformationDefinition def, TransformContext ctx) {
-        // source step → Iterator<DataRow>  (e.g., CsvReader, JdbcReader)
-        // chain of RowTransformers: each wraps the previous Iterator
-        // sink step → writes output (e.g., CsvWriter, JdbcWriter)
-
         Iterator<DataRow> pipeline = sourceStep.read(ctx);
         for (RowTransformer step : transformSteps) {
             pipeline = step.apply(pipeline, ctx);   // lazy — nothing executes yet
@@ -259,49 +461,29 @@ public class TransformationPipeline {
 }
 ```
 
-### 5.6 The Bridge: Orchestration ↔ Transformation
-
-```java
-/**
- * Job step that runs a transformation. This is the bridge between
- * the Reactor orchestration layer and the plain Java transformation layer.
- */
-public class RunTransformationStep implements StepExecutor {
-
-    private final TransformationPipeline pipeline;
-    private final TransformationDefinition definition;
-
-    @Override
-    public Mono<StepResult> execute(JobContext context) {
-        // Bridge: wrap the blocking plain-Java pipeline in a Mono
-        return Mono.fromCallable(() -> pipeline.execute(definition, context.toTransformContext()))
-                   .subscribeOn(Schedulers.boundedElastic())
-                   .map(result -> new StepResult(StepStatus.SUCCESS, context, result.toMap()));
-    }
-}
-```
-
 ---
 
-## 6. Automation Engine: Pentaho XML → Java Code
+## 6. Automation Engine: Pentaho XML → JobDefinition Classes
 
-This is the key accelerator for migrating 1,500 jobs without hand-coding each one.
+The code generator produces **pure data classes** (JobGraph declarations) that
+reference the 85 step components. No execution logic is generated.
 
 ### 6.1 Pipeline
 
 ```
-.kjb/.ktr files
+.kjb files (1,500)
       │
       ▼
-┌──────────────┐    ┌────────────────┐    ┌──────────────────┐
-│ Pentaho XML  │───►│ Intermediate   │───►│ Java Source Code  │
-│ Parser       │    │ Representation │    │ Generator         │
-└──────────────┘    │ (IR)           │    └──────────────────┘
-                    └────────────────┘           │
-                                                 ▼
-                                        ┌──────────────────┐
-                                        │ Compile & Validate│
-                                        └──────────────────┘
+┌──────────────┐    ┌────────────────┐    ┌──────────────────────────────┐
+│ Pentaho XML  │───►│ Intermediate   │───►│ Java Source Code Generator    │
+│ Parser       │    │ Representation │    │ (produces JobDefinition class │
+└──────────────┘    │ (IR)           │    │  with JobGraph.builder()...)  │
+                    └────────────────┘    └──────────────────────────────┘
+                                                    │
+                                                    ▼
+                                           ┌──────────────────┐
+                                           │ Compile & Validate│
+                                           └──────────────────┘
 ```
 
 ### 6.2 Intermediate Representation (IR)
@@ -323,39 +505,50 @@ public record StepIR(
 public record HopIR(String from, String to, HopType type) {}
 ```
 
-### 6.3 Code Generator Strategy
+### 6.3 Code Generator: Pentaho Step Type → Step Component Mapping
 
-For each Pentaho step type, we need a **CodeGenTemplate**:
+The generator maps each Pentaho step type to one of the 85 step components:
 
-| Pentaho Step Type | Code Generator Produces |
+| Pentaho Step Type (.kjb) | Generated Code (references step component) |
 |---|---|
-| `START` | Entry point of Mono chain |
-| `TABLE_INPUT` | `Flux<DataRow>` from R2DBC query |
-| `TABLE_OUTPUT` | `.flatMap(row -> r2dbcInsert(row))` |
-| `SELECT_VALUES` | `.map(row -> row.select("col1","col2"))` |
-| `FILTER_ROWS` | `.filter(row -> condition)` |
-| `SWITCH_CASE` | `.groupBy(row -> classify(row))` |
-| `HTTP_CLIENT` | `webClient.get()...` |
-| `SCRIPT` | Inline Groovy/JS eval (escape hatch) |
-| `SORT_ROWS` | `IndexSortOperator` (Record-based, plain Java) |
-| `GROUP_BY` | `StreamingGroupByOperator` — Iterator over sorted input |
-| `UNIQUE_ROWS` | `StreamingDedupeOperator` — Iterator, O(1) memory |
-| `MERGE_JOIN` | `StreamingMergeJoinOperator` — two sorted Iterators, pointer merge |
-| `SUCCESS` | `.then()` terminal |
-| `MAIL` | Mail-sending step |
-| `ABORT` | `.error(new AbortException(...))` |
-| `SHELL` | `ProcessBuilder` wrapped in `Mono.fromCallable()` |
-| `JOB` (sub-job) | `jobOrchestrator.execute(subJobDef, ctx)` |
-| `TRANS` (sub-trans) | `transformPipeline.execute(subTransDef, ctx)` |
+| `START` | `Steps.start()` |
+| `SQL` | `sqlExecuteStep.with(query)` |
+| `HTTP` | `httpPostStep.with(url, payload)` |
+| `MAIL` | `mailStep.with(to, subject, body)` |
+| `SHELL` | `shellCommandStep.with(command)` |
+| `SFTP_PUT` | `sftpPutStep.with(host, path)` |
+| `ABORT` | `Steps.abort(message)` |
+| `SUCCESS` | `Steps.success()` |
+| `JOB` (sub-job) | `runJobStep.with(subJobDef)` |
+| `TRANS` (sub-trans) | `runTransformationStep.with(transformDef)` |
+| `EVAL` | `evalConditionStep.with(expression)` |
+| `SET_VARIABLES` | `setVariableStep.with(varName, value)` |
 
-### 6.4 Handling the Long Tail
+The generator also emits hop wiring:
 
-With 1,500 jobs, there will be a "long tail" of rare step types. Strategy:
+| Pentaho Hop | Generated Code |
+|---|---|
+| OK hop | `.hop("stepA", "stepB", HopType.OK)` |
+| Error hop | `.hop("stepA", "errorHandler", HopType.ERROR)` |
+| Unconditional hop | `.hop("stepA", "stepB", HopType.UNCONDITIONAL)` |
 
-1. **Audit first**: Parse all 1,500 files, count step types by frequency
-2. **80/20 rule**: The top ~15 step types will cover ~80%+ of all steps
-3. **Build generators for the top types first**
-4. **Scripting escape hatch**: For rare/complex steps, generate a `ScriptStep` that embeds the original logic
+### 6.4 The 85 Step Components: Build Priority
+
+With 85 distinct step types identified, build in priority order:
+
+| Priority | Step Types | Count | Coverage |
+|---|---|---|---|
+| **P1 — Build first** | SqlQuery, SqlExecute, RunTransformation, RunJob, Start, Success, Mail, Shell, SetVariable, FileCopy, SftpGet, SftpPut, HttpPost, Abort, Dummy | ~15 | ~80% of all jobs |
+| **P2 — Build second** | StoredProc, BulkLoad, TableExists, CheckDbConn, FileExists, FileDelete, ExcelRead, KafkaProduce, S3Upload, SshExec, Delay, WaitForFile, EvalCondition, WriteToLog, etc. | ~35 | ~95% of all jobs |
+| **P3 — Build last** | Remaining rare/specialized steps | ~35 | 100% |
+| **Escape hatch** | Any unsupported step → `GroovyScriptStep` wrapping original logic | 1 | Fallback for anything |
+
+### 6.5 Handling the Long Tail
+
+1. **Audit first**: Parse all 1,500 .kjb files, count step type usage by frequency
+2. **80/20 rule**: The top ~15 step types will cover ~80% of all jobs
+3. **Build the 15 P1 components first** — unblocks bulk of migration
+4. **Scripting escape hatch**: For rare steps not yet built, generate a `GroovyScriptStep`
 5. **Manual review queue**: Flag jobs that use unsupported types for human review
 
 ---
@@ -377,26 +570,28 @@ With 1,500 jobs, there will be a "long tail" of rare step types. Strategy:
 
 ### Phase 2: Engine Foundation (Weeks 3-7)
 
-- [ ] Set up Spring Boot WebFlux project structure
-- [ ] Implement core abstractions: `DataRow`, `StepExecutor`, `RowTransformer`
-- [ ] Implement `JobOrchestrator` (graph walker → Mono chain builder)
-- [ ] Implement `TransformationPipeline` (Flux chain builder)
-- [ ] Implement `JobContext` with reactive context propagation
-- [ ] Build connector layer: R2DBC, JDBC-elastic, WebClient, File I/O
-- [ ] Build observability: metrics, tracing, structured logging
-- [ ] Build the top 10-15 step executors (DB input/output, file I/O, select, filter, etc.)
+- [ ] Set up Spring Boot project (WebFlux for API, standard for engines)
+- [ ] Implement `StepExecutor` @FunctionalInterface + `StepResult` record
+- [ ] Implement `JobDefinition` + `JobGraph` (graph model with hops)
+- [ ] Implement `DagExecutor` (common engine: walks graph, chains Monos)
+- [ ] Implement `JobContext` (immutable map, variable resolution)
+- [ ] Implement `TransformationPipeline` (plain Java Iterator chain)
+- [ ] Implement `DataRow` + `RowTransformer` (transformation abstractions)
+- [ ] Build connector layer: JDBC/HikariCP, WebClient, File I/O
+- [ ] Build observability: Micrometer metrics, OpenTelemetry tracing, SLF4J logging
+- [ ] Build the P1 step components (~15): SqlQuery, RunTransformation, Mail, Shell, etc.
 - [ ] Integration test framework with embedded DB and mock servers
 
 ### Phase 3: Code Generator (Weeks 6-10)
 
-- [ ] Build code generator: IR → Java source files
-- [ ] Template per step type (start with top 15)
-- [ ] Handle hop wiring (OK/Error/Unconditional → flatMap/onErrorResume/then)
-- [ ] Handle parallel branches (fan-out/fan-in)
-- [ ] Handle sub-job and sub-transformation references
-- [ ] Handle parameter/variable substitution
-- [ ] Output: compilable Spring `@Component` classes per job
-- [ ] Validation: compile check + static analysis on generated code
+- [ ] Build code generator: IR → `JobDefinition` Java source files
+- [ ] Map each Pentaho step type → appropriate step component reference
+- [ ] Emit `JobGraph.builder()` with all step + hop declarations
+- [ ] Handle sub-job references (`RunJobStep`) and sub-transformation references (`RunTransformationStep`)
+- [ ] Handle parameter/variable substitution in step configs
+- [ ] Output: compilable Spring `@Component` classes (pure data, no logic)
+- [ ] Validation: compile check + verify all referenced step components exist
+- [ ] Build P2 step components (~35) as needed by generated jobs
 
 ### Phase 4: Batch Migration (Weeks 9-16)
 
