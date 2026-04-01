@@ -2,7 +2,10 @@
 
 ## 1. Problem Statement
 
-Migrate **1,500 Pentaho jobs/transformations** (.kjb/.ktr) to a Java-based orchestration and transformation engine built on **Spring Reactor WebFlux (Mono/Flux)**.
+Migrate **1,500 Pentaho jobs/transformations** (.kjb/.ktr) to a Java-based engine with a clean architectural split:
+
+- **Orchestration (.kjb)** → **Spring Reactor (Mono)** — async step sequencing, parallel fan-out/fan-in, error routing
+- **Transformation (.ktr)** → **Plain Java (Stream/Iterator)** — row-by-row data processing, CPU-bound, simple and debuggable
 
 ### Why Migrate?
 
@@ -10,31 +13,43 @@ Migrate **1,500 Pentaho jobs/transformations** (.kjb/.ktr) to a Java-based orche
 - XML-based job/transformation definitions are fragile and hard to refactor
 - Limited observability, retry semantics, and backpressure handling
 - Licensing and operational costs
-- Reactive stack enables non-blocking, high-throughput data pipelines
+- Reactor for orchestration gives non-blocking async coordination
+- Plain Java for transformations keeps code simple, debuggable, and maintainable
 
 ---
 
 ## 2. Pentaho Concepts → Java Mapping
 
-| Pentaho Concept | Java/Reactor Equivalent |
+### Orchestration (.kjb) → Reactor Mono
+
+| Pentaho Concept | Java Equivalent |
 |---|---|
-| **Job (.kjb)** | `Mono<Void>` orchestration chain (a sequence of steps) |
-| **Transformation (.ktr)** | `Flux<Row>` data processing pipeline |
-| **Job Entry (step)** | A `StepExecutor` bean returning `Mono<StepResult>` |
+| **Job (.kjb)** | `Mono<JobResult>` orchestration chain |
+| **Job Entry (step)** | `StepExecutor` returning `Mono<StepResult>` |
 | **Hop (OK/Error/Unconditional)** | `.flatMap()` / `.onErrorResume()` / `.then()` |
-| **Transformation Step** | A `RowTransformer` operator in a Flux pipeline |
-| **Row** | A `DataRow` (Map-like or strongly-typed POJO) |
-| **Variables / Parameters** | `JobContext` (reactive context / immutable map) |
+| **Variables / Parameters** | `JobContext` (immutable map, passed through chain) |
 | **Sub-job** | Nested `Mono<StepResult>` composition |
-| **Sub-transformation** | Nested `Flux<DataRow>` composition |
-| **Parallel execution** | `Flux.merge()` / `Mono.zip()` / `parallel().runOn()` |
+| **Parallel execution** | `Mono.zip(step1, step2, step3)` |
 | **Sequential execution** | `Mono.then()` / `.flatMap()` chaining |
-| **Conditional hop** | `.filter()` / `.switchIfEmpty()` / `Mono.defer()` |
+| **Conditional hop** | `Mono.defer(() -> condition ? stepA : stepB)` |
 | **Error handling** | `.onErrorResume()` / `.retry()` / `.onErrorMap()` |
-| **Logging** | MDC-aware reactive logging via `contextWrite()` |
-| **Database connection** | R2DBC `ConnectionFactory` (reactive) or JDBC via `Schedulers.boundedElastic()` |
-| **File I/O** | `Flux<DataBuffer>` / reactive file reading |
-| **REST calls** | `WebClient` returning `Mono<T>` / `Flux<T>` |
+| **REST calls** | `WebClient` returning `Mono<T>` |
+
+### Transformation (.ktr) → Plain Java
+
+| Pentaho Concept | Java Equivalent |
+|---|---|
+| **Transformation (.ktr)** | `TransformationPipeline` using `Iterator<DataRow>` / `Stream<DataRow>` |
+| **Transformation Step** | `RowTransformer` — plain Java function |
+| **Row** | `DataRow` (Map-backed or POJO) |
+| **File I/O** | `BufferedReader` / `BufferedWriter` (standard Java I/O) |
+| **Database** | JDBC `PreparedStatement` (standard, blocking — it's fine) |
+| **Select Values** | `.map(row -> row.select("col1","col2"))` |
+| **Filter Rows** | `.filter(row -> condition)` |
+| **Sort Rows** | `IndexSortOperator` (Record-based, see Section 10) |
+| **Group By** | `StreamingGroupBy` on sorted input |
+| **Logging** | SLF4J + MDC (standard, no reactive context needed) |
+| **Error handling** | `try/catch` — simple, debuggable stack traces |
 
 ---
 
@@ -42,37 +57,46 @@ Migrate **1,500 Pentaho jobs/transformations** (.kjb/.ktr) to a Java-based orche
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        API / Trigger Layer                       │
-│  (REST endpoints, Scheduler/Cron, Kafka consumers, File watch)  │
+│                   API / Trigger Layer (WebFlux)                   │
+│  REST endpoints, Scheduler/Cron, Kafka consumers, File watch     │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Job Orchestrator Engine                      │
-│                                                                 │
-│  JobDefinition ──► builds Mono<Void> chain from step graph      │
-│  Handles: sequencing, parallelism, conditionals, error routing  │
+│          Job Orchestrator Engine  ← REACTOR (Mono/Flux)          │
+│                                                                  │
+│  JobDefinition ──► builds Mono<JobResult> chain from step graph  │
+│  Handles: sequencing, parallelism, conditionals, error routing   │
+│                                                                  │
+│  step1.execute(ctx)                                              │
+│    .flatMap(r -> Mono.zip(step2a.execute(r), step2b.execute(r))) │
+│    .flatMap(r -> step3.execute(r))                               │
+│    .onErrorResume(e -> errorStep.execute(ctx))                   │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
               ┌────────────┼────────────┐
               ▼            ▼            ▼
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│ Step Executor│ │ Step Executor│ │ Step Executor│
-│  (DB Query)  │ │ (REST Call)  │ │ (Transform)  │
+│ Step: DB     │ │ Step: REST   │ │ Step: Run    │
+│ (Mono-based) │ │ (WebClient)  │ │ Transformation│
 └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
        │                │                │
-       ▼                ▼                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  Transformation Engine                           │
-│                                                                 │
-│  Flux<DataRow> pipeline: read → transform → transform → write   │
-│  Handles: row-level ops, lookups, aggregations, splits, joins   │
-└─────────────────────────────────────────────────────────────────┘
-       │                │                │
-       ▼                ▼                ▼
+       │                │                ▼
+       │                │   ┌─────────────────────────────────┐
+       │                │   │  Transformation Engine           │
+       │                │   │  ← PLAIN JAVA (Stream/Iterator)  │
+       │                │   │                                   │
+       │                │   │  Iterator<DataRow> pipeline:      │
+       │                │   │  read → map → filter → sort       │
+       │                │   │  → group → write                  │
+       │                │   │                                   │
+       │                │   │  Simple, debuggable, no reactive  │
+       │                │   └──────────┬────────────────────────┘
+       │                │              │
+       ▼                ▼              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Connector Layer                               │
-│  R2DBC / JDBC / WebClient / S3 / SFTP / Kafka / File I/O       │
+│  JDBC / BufferedReader / BufferedWriter / WebClient / SFTP / S3 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -88,33 +112,51 @@ pentaho-to-java/
 │   ├── code-generator/                  # IR → Java source code generation
 │   └── validation/                      # Validates generated code vs original
 │
-├── orchestration-engine/                # Runtime engine
+├── orchestration-engine/                # Job orchestration — REACTOR (Mono)
 │   ├── core/                            # Core abstractions
-│   │   ├── model/                       # JobDefinition, StepDefinition, DataRow
+│   │   ├── model/                       # JobDefinition, StepDefinition
 │   │   ├── engine/                      # JobOrchestrator, StepExecutor SPI
 │   │   ├── context/                     # JobContext, variable resolution
 │   │   └── error/                       # Error handling, retry policies
 │   │
-│   ├── steps/                           # Built-in step implementations
-│   │   ├── db/                          # TableInput, TableOutput, DBLookup
-│   │   ├── file/                        # CsvFileInput (streaming), ExcelInput, FileOutput
-│   │   ├── transform/                   # SelectValues, Calculator, ScriptStep
-│   │   ├── blocking/                    # ExternalSort, StreamingGroupBy, StreamingDedupe
-│   │   ├── flow/                        # Switch/Case, Filter, Abort, Dummy
-│   │   ├── rest/                        # HttpClient step, REST input
+│   ├── steps/                           # Built-in job step implementations (Mono-based)
+│   │   ├── db/                          # SQL execute, stored proc calls
+│   │   ├── rest/                        # WebClient HTTP calls
+│   │   ├── flow/                        # Switch/Case, Abort, Dummy, sub-job
 │   │   ├── messaging/                   # Kafka produce/consume, JMS
-│   │   └── scripting/                   # Groovy/JS script step (escape hatch)
+│   │   ├── shell/                       # Shell command execution
+│   │   ├── mail/                        # Email notifications
+│   │   └── transform/                   # RunTransformation step (bridge to plain Java)
 │   │
-│   ├── connectors/                      # Connection management
-│   │   ├── r2dbc/                       # Reactive DB connections
-│   │   ├── jdbc/                        # Blocking DB (wrapped in elastic scheduler)
-│   │   ├── sftp/                        # SFTP connector
-│   │   └── s3/                          # S3 connector
+│   └── connectors/                      # Async connection management
+│       ├── webclient/                   # Spring WebClient (REST)
+│       └── kafka/                       # Reactor Kafka
+│
+├── transformation-engine/               # Data transformation — PLAIN JAVA
+│   ├── core/                            # Core abstractions
+│   │   ├── model/                       # DataRow, TransformationDefinition
+│   │   ├── pipeline/                    # TransformationPipeline (Iterator-based)
+│   │   └── context/                     # TransformContext, variable resolution
+│   │
+│   ├── steps/                           # Built-in transform steps (plain Java)
+│   │   ├── io/                          # CsvReader, CsvWriter, ExcelReader, FileOutput
+│   │   ├── db/                          # TableInput (JDBC), TableOutput, DBLookup
+│   │   ├── transform/                   # SelectValues, Calculator, ValueMapper
+│   │   ├── sort/                        # IndexSortOperator, InMemorySort
+│   │   ├── aggregate/                   # StreamingGroupBy, StreamingDedupe
+│   │   ├── join/                        # StreamingMergeJoin, HashLookupJoin
+│   │   ├── flow/                        # Filter, SwitchCase, Abort
+│   │   └── scripting/                   # Groovy script step (escape hatch)
+│   │
+│   ├── connectors/                      # Blocking I/O (plain Java — no wrappers needed)
+│   │   ├── jdbc/                        # JDBC + HikariCP
+│   │   ├── sftp/                        # JSch / Apache SSHD
+│   │   └── s3/                          # AWS SDK
 │   │
 │   └── observability/                   # Monitoring & tracing
-│       ├── metrics/                     # Micrometer metrics per step/job
-│       ├── tracing/                     # Distributed tracing (OpenTelemetry)
-│       └── logging/                     # Structured logging with MDC context
+│       ├── metrics/                     # Micrometer (rows processed, throughput)
+│       ├── tracing/                     # OpenTelemetry spans per step
+│       └── logging/                     # SLF4J + MDC (standard, simple)
 │
 ├── generated-jobs/                      # Auto-generated Java jobs (output of migration)
 │   ├── domain-a/
@@ -148,11 +190,11 @@ public interface DataRow {
 }
 ```
 
-### 5.2 StepExecutor (SPI for Job Steps)
+### 5.2 StepExecutor — Reactor (for orchestration job entries)
 
 ```java
 public interface StepExecutor {
-    /** Execute one step in a job, returning a result. */
+    /** Execute one step in a job. Returns Mono for async composition. */
     Mono<StepResult> execute(JobContext context);
 }
 
@@ -163,16 +205,19 @@ public record StepResult(
 ) {}
 ```
 
-### 5.3 RowTransformer (SPI for Transformation Steps)
+### 5.3 RowTransformer — Plain Java (for transformation steps)
 
 ```java
 public interface RowTransformer {
-    /** Transform a stream of rows. */
-    Flux<DataRow> apply(Flux<DataRow> input, TransformContext context);
+    /**
+     * Transform rows. Plain Java — no Reactor types.
+     * Accepts and returns Iterator for lazy, memory-efficient streaming.
+     */
+    Iterator<DataRow> apply(Iterator<DataRow> input, TransformContext context);
 }
 ```
 
-### 5.4 JobOrchestrator (Builds the Reactive Chain)
+### 5.4 JobOrchestrator — Reactor (builds Mono chain from job graph)
 
 ```java
 public class JobOrchestrator {
@@ -186,15 +231,52 @@ public class JobOrchestrator {
 }
 ```
 
-### 5.5 TransformationPipeline (Builds Flux Chains)
+### 5.5 TransformationPipeline — Plain Java (builds Iterator chain)
 
 ```java
 public class TransformationPipeline {
 
-    public Flux<DataRow> execute(TransformationDefinition def, TransformContext ctx) {
-        // source step → Flux<DataRow>
-        // chain of RowTransformers via .transform()
-        // sink step → write output
+    /**
+     * Executes a transformation as a plain Java Iterator pipeline.
+     * No reactive types — simple, debuggable, standard Java.
+     *
+     * Called from orchestration layer via:
+     *   Mono.fromCallable(() -> pipeline.execute(def, ctx))
+     *       .subscribeOn(Schedulers.boundedElastic())
+     */
+    public TransformResult execute(TransformationDefinition def, TransformContext ctx) {
+        // source step → Iterator<DataRow>  (e.g., CsvReader, JdbcReader)
+        // chain of RowTransformers: each wraps the previous Iterator
+        // sink step → writes output (e.g., CsvWriter, JdbcWriter)
+
+        Iterator<DataRow> pipeline = sourceStep.read(ctx);
+        for (RowTransformer step : transformSteps) {
+            pipeline = step.apply(pipeline, ctx);   // lazy — nothing executes yet
+        }
+        sinkStep.write(pipeline, ctx);              // pulls rows through the chain
+        return new TransformResult(ctx.getMetrics());
+    }
+}
+```
+
+### 5.6 The Bridge: Orchestration ↔ Transformation
+
+```java
+/**
+ * Job step that runs a transformation. This is the bridge between
+ * the Reactor orchestration layer and the plain Java transformation layer.
+ */
+public class RunTransformationStep implements StepExecutor {
+
+    private final TransformationPipeline pipeline;
+    private final TransformationDefinition definition;
+
+    @Override
+    public Mono<StepResult> execute(JobContext context) {
+        // Bridge: wrap the blocking plain-Java pipeline in a Mono
+        return Mono.fromCallable(() -> pipeline.execute(definition, context.toTransformContext()))
+                   .subscribeOn(Schedulers.boundedElastic())
+                   .map(result -> new StepResult(StepStatus.SUCCESS, context, result.toMap()));
     }
 }
 ```
@@ -255,10 +337,10 @@ For each Pentaho step type, we need a **CodeGenTemplate**:
 | `SWITCH_CASE` | `.groupBy(row -> classify(row))` |
 | `HTTP_CLIENT` | `webClient.get()...` |
 | `SCRIPT` | Inline Groovy/JS eval (escape hatch) |
-| `SORT_ROWS` | `ExternalSortOperator` (disk-backed, only true blocking step) |
-| `GROUP_BY` | `StreamingGroupByOperator` — `.bufferUntilChanged()` on sorted input |
-| `UNIQUE_ROWS` | `StreamingDedupeOperator` — `.distinctUntilChanged()` on sorted input |
-| `MERGE_JOIN` | `StreamingMergeJoinOperator` — two sorted streams, pointer merge |
+| `SORT_ROWS` | `IndexSortOperator` (Record-based, plain Java) |
+| `GROUP_BY` | `StreamingGroupByOperator` — Iterator over sorted input |
+| `UNIQUE_ROWS` | `StreamingDedupeOperator` — Iterator, O(1) memory |
+| `MERGE_JOIN` | `StreamingMergeJoinOperator` — two sorted Iterators, pointer merge |
 | `SUCCESS` | `.then()` terminal |
 | `MAIL` | Mail-sending step |
 | `ABORT` | `.error(new AbortException(...))` |
@@ -349,16 +431,20 @@ With 1,500 jobs, there will be a "long tail" of rare step types. Strategy:
 
 ## 8. Key Design Decisions to Make
 
-| Decision | Options | Recommendation |
+| Decision | Options | **Decision** |
 |---|---|---|
-| **Blocking vs Reactive DB** | R2DBC everywhere vs JDBC on elastic scheduler | Start with JDBC-on-elastic (broader driver support), migrate hot paths to R2DBC |
+| **Orchestration framework** | Reactor everywhere vs Reactor+plain Java hybrid | **Hybrid**: Reactor `Mono` for orchestration (.kjb), plain Java `Iterator` for transforms (.ktr) |
+| **DB access (transforms)** | R2DBC vs JDBC | **JDBC + HikariCP** — transforms are plain Java, no reactive wrappers needed |
+| **DB access (orchestration)** | R2DBC vs JDBC-on-elastic | JDBC-on-elastic (broader driver support; R2DBC optional for high-concurrency steps) |
 | **Row representation** | Generic Map vs typed POJOs | Generic `DataRow` (Map-backed) for flexibility; typed POJOs for high-frequency paths |
 | **Job definition format** | Pure Java code vs external DSL/YAML | Java code (type-safe, IDE support, testable, debuggable) |
-| **Scheduling** | Spring `@Scheduled` vs Quartz vs external (Airflow/K8s CronJob) | External scheduler triggering via REST API (decouples scheduling from execution) |
+| **Scheduling** | Spring `@Scheduled` vs Quartz vs external | External scheduler triggering via REST API (decouples scheduling from execution) |
 | **Error handling** | Fail-fast vs configurable retry | Configurable per-step: retry count, backoff, dead-letter |
 | **State management** | Stateless vs checkpoint/resume | Stateless first; add checkpointing for long-running jobs later |
 | **Script steps** | GraalVM polyglot vs Groovy | Groovy (mature Spring integration, familiar to Java devs) |
-| **Testing strategy** | Unit per step vs E2E parity | Both: unit tests for steps, parity tests for full job equivalence |
+| **Testing (transforms)** | StepVerifier vs plain JUnit | **Plain JUnit assertions** — no reactive test complexity needed |
+| **Testing (orchestration)** | StepVerifier vs plain JUnit | StepVerifier for Mono chains |
+| **Testing (E2E)** | Parity testing | Testcontainers + output comparison vs Pentaho |
 
 ---
 
@@ -473,96 +559,83 @@ public record SortEntry(
 }
 ```
 
-#### Design: `IndexSortOperator`
+#### Design: `IndexSortOperator` (Plain Java)
 
 ```java
 public class IndexSortOperator implements RowTransformer {
 
     private final List<SortField> sortFields;
-    private final Path sourceFile;        // original CSV file path
+    private final Path sourceFile;
 
     @Override
-    public Flux<DataRow> apply(Flux<DataRow> input, TransformContext context) {
-        // Pass 1: Build sorted index
-        return input
-            .map(row -> new SortEntry(extractSortKeys(row), row.getByteOffset()))
-            .collectList()
-            .map(entries -> {
-                // In-memory sort — lightweight records, fits in heap
-                entries.sort(Comparator.naturalOrder());
-                // Or: Arrays.parallelSort() for multi-core speedup
-                return entries;
-            })
-            // Pass 2: Emit full rows in sorted order
-            .flatMapMany(sortedEntries -> readRowsInOrder(sortedEntries));
+    public Iterator<DataRow> apply(Iterator<DataRow> input, TransformContext context) {
+        // Pass 1: Build sorted index — lightweight records only
+        List<SortEntry> entries = new ArrayList<>();
+        while (input.hasNext()) {
+            DataRow row = input.next();
+            entries.add(new SortEntry(extractSortKeys(row), row.getByteOffset()));
+        }
+
+        // In-memory sort — 40 bytes/entry, fits in heap for millions of rows
+        SortEntry[] array = entries.toArray(SortEntry[]::new);
+        Arrays.parallelSort(array);
+
+        // Pass 2: Return iterator that reads full rows in sorted order
+        return new SortedRowIterator(array, sourceFile);
+    }
+}
+
+/**
+ * Lazily reads full rows from the CSV file using byte offsets.
+ * Only one row is in memory at a time during iteration.
+ */
+class SortedRowIterator implements Iterator<DataRow>, AutoCloseable {
+    private final SortEntry[] sortedEntries;
+    private final RandomAccessFile raf;
+    private int index = 0;
+
+    SortedRowIterator(SortEntry[] sortedEntries, Path sourceFile) {
+        this.sortedEntries = sortedEntries;
+        this.raf = new RandomAccessFile(sourceFile.toFile(), "r");
     }
 
-    /**
-     * Reads full rows from the CSV file using the byte offsets
-     * from the sorted index. Uses RandomAccessFile for seek.
-     */
-    private Flux<DataRow> readRowsInOrder(List<SortEntry> sortedEntries) {
-        return Flux.using(
-            () -> new RandomAccessFile(sourceFile.toFile(), "r"),
-            raf -> Flux.fromIterable(sortedEntries)
-                       .map(entry -> {
-                           raf.seek(entry.byteOffset());
-                           String line = raf.readLine();
-                           return parseLine(line);
-                       }),
-            raf -> closeQuietly(raf)
-        ).subscribeOn(Schedulers.boundedElastic());
+    @Override public boolean hasNext() { return index < sortedEntries.length; }
+
+    @Override
+    public DataRow next() {
+        SortEntry entry = sortedEntries[index++];
+        raf.seek(entry.byteOffset());
+        return parseLine(raf.readLine());
     }
+
+    @Override public void close() { closeQuietly(raf); }
 }
 ```
 
 #### Optimizing Pass 2: Sequential vs Random Access
 
-If sorted order is close to file order, sequential read is fast. If not, random
-seeks on HDD are slow. Optimization strategies:
-
 | Strategy | When to use |
 |---|---|
 | **RandomAccessFile seek** | SSD storage (seek is ~0.1ms) — works for any order |
-| **Batch + sequential re-read** | HDD storage — group offsets into page-aligned chunks, read sequentially |
-| **Memory-mapped file** | `MappedByteBuffer` via `FileChannel.map()` — OS handles caching, great for repeated access |
+| **Batch + sequential re-read** | HDD — group offsets into page-aligned chunks, read sequentially |
+| **Memory-mapped file** | `MappedByteBuffer` via `FileChannel.map()` — OS handles caching |
+
+### Design: Streaming CSV Reader (Plain Java)
+
+The CSV reader must track **byte offsets** so the sort index can reference rows.
 
 ```java
-// Memory-mapped variant (best for SSD, good for large files)
-private Flux<DataRow> readRowsInOrder(List<SortEntry> sortedEntries) {
-    return Mono.fromCallable(() -> {
-        try (FileChannel channel = FileChannel.open(sourceFile, StandardOpenOption.READ)) {
-            MappedByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
-            return sortedEntries.stream()
-                .map(entry -> readRowAt(buffer, entry.byteOffset()))
-                .toList();
-        }
-    }).flatMapMany(Flux::fromIterable)
-      .subscribeOn(Schedulers.boundedElastic());
-}
-```
-
-### Design: Streaming CSV Reader
-
-The CSV reader itself must be non-buffering — never load the full file.
-Critically, it must **track byte offsets** so the sort index can reference them.
-
-```java
-public class ReactiveCsvReader {
+public class CsvReader {
 
     /**
-     * Reads a CSV file as a Flux<DataRow>, streaming line by line.
-     * Each DataRow carries its byte offset in the source file,
-     * enabling the IndexSortOperator to seek back for Pass 2.
+     * Reads a CSV file as an Iterator<DataRow>, streaming line by line.
+     * Each DataRow carries its byte offset in the source file.
+     * Memory: O(1) — one row at a time.
      */
-    public Flux<DataRow> read(Path csvFile, CsvConfig config) {
-        return Flux.using(
-            () -> new OffsetTrackingReader(csvFile, config.charset()),
-            reader -> Flux.fromStream(reader.linesWithOffsets())
-                          .skip(config.hasHeader() ? 1 : 0)
-                          .map(offsetLine -> parseLine(offsetLine, config)),
-            reader -> closeQuietly(reader)
-        ).subscribeOn(Schedulers.boundedElastic());
+    public Iterator<DataRow> read(Path csvFile, CsvConfig config) {
+        OffsetTrackingReader reader = new OffsetTrackingReader(csvFile, config.charset());
+        if (config.hasHeader()) reader.skipHeader();
+        return new CsvRowIterator(reader, config);
     }
 }
 ```
@@ -585,24 +658,27 @@ public RowTransformer createSortStep(SortConfig config, long estimatedRows) {
     long indexMemory = estimatedRows * config.getRecordOverhead();
 
     if (estimatedRows < 500_000) {
-        // Tier 1 — Small dataset: full in-memory sort (simplest, fastest)
-        return input -> input.collectSortedList(comparator)
-                             .flatMapMany(Flux::fromIterable);
+        // Tier 1 — Small: full in-memory sort
+        return (input, ctx) -> {
+            List<DataRow> all = collectToList(input);
+            all.sort(comparator);
+            return all.iterator();
+        };
 
     } else if (indexMemory < config.getMaxHeapBudget()) {
-        // Tier 2 — Large dataset: Record index sort (no disk I/O, ~10-15x less memory)
+        // Tier 2 — Large: Record index sort (no disk I/O, ~10-15x less memory)
         return new IndexSortOperator(config);
 
     } else {
-        // Tier 3 — Extreme dataset (25M+ rows): external merge sort (disk-backed fallback)
+        // Tier 3 — Extreme (25M+ rows): external merge sort (disk-backed fallback)
         return new ExternalSortOperator(config);
     }
 }
 ```
 
-### Streaming Operators (NOT Blocking)
+### Streaming Operators — Plain Java (NOT Blocking)
 
-These all operate on sorted input and use O(1) memory relative to total row count:
+All operate on sorted `Iterator<DataRow>` input. O(1) memory. No Reactor types.
 
 #### Streaming Group By
 
@@ -610,24 +686,26 @@ These all operate on sorted input and use O(1) memory relative to total row coun
 public class StreamingGroupByOperator implements RowTransformer {
 
     @Override
-    public Flux<DataRow> apply(Flux<DataRow> sortedInput, TransformContext ctx) {
-        // Input MUST be sorted by group key (engine ensures this)
-        return sortedInput
-            .bufferUntilChanged(row -> row.get(groupKey))  // consecutive groups
-            .map(group -> aggregate(group));                // emit one row per group
-        // Memory: only holds ONE group at a time
+    public Iterator<DataRow> apply(Iterator<DataRow> sortedInput, TransformContext ctx) {
+        // Returns an iterator that:
+        // - Reads consecutive rows with same group key
+        // - Aggregates them (sum, count, min, max, etc.)
+        // - Emits one result row per group
+        // Memory: holds only ONE group at a time
+        return new GroupByIterator(sortedInput, groupKey, aggregations);
     }
 
-    // For unsorted input with LOW cardinality (< threshold):
-    public Flux<DataRow> applyUnsorted(Flux<DataRow> input, TransformContext ctx) {
-        Map<Object, Accumulator> accumulators = new ConcurrentHashMap<>();
-        return input
-            .doOnNext(row -> accumulators
-                .computeIfAbsent(row.get(groupKey), k -> new Accumulator())
-                .add(row))
-            .then(Mono.fromCallable(() -> accumulators.values()))
-            .flatMapMany(Flux::fromIterable)
-            .map(Accumulator::toRow);
+    // For unsorted input with LOW cardinality:
+    public Iterator<DataRow> applyUnsorted(Iterator<DataRow> input, TransformContext ctx) {
+        Map<Object, Accumulator> accumulators = new HashMap<>();
+        while (input.hasNext()) {
+            DataRow row = input.next();
+            accumulators.computeIfAbsent(row.get(groupKey), k -> new Accumulator())
+                        .add(row);
+        }
+        return accumulators.values().stream()
+            .map(Accumulator::toRow)
+            .iterator();
         // Memory: O(G) where G = number of distinct groups (must be small)
     }
 }
@@ -639,9 +717,31 @@ public class StreamingGroupByOperator implements RowTransformer {
 public class StreamingDedupeOperator implements RowTransformer {
 
     @Override
-    public Flux<DataRow> apply(Flux<DataRow> sortedInput, TransformContext ctx) {
-        return sortedInput.distinctUntilChanged(row -> row.get(dedupeKey));
-        // Memory: O(1) — only holds previous row for comparison
+    public Iterator<DataRow> apply(Iterator<DataRow> sortedInput, TransformContext ctx) {
+        return new Iterator<>() {
+            private DataRow next = advance();
+            private Object lastKey = null;
+
+            private DataRow advance() {
+                while (sortedInput.hasNext()) {
+                    DataRow row = sortedInput.next();
+                    Object key = row.get(dedupeKey);
+                    if (!Objects.equals(key, lastKey)) {
+                        lastKey = key;
+                        return row;
+                    }
+                }
+                return null;
+            }
+
+            @Override public boolean hasNext() { return next != null; }
+            @Override public DataRow next() {
+                DataRow current = next;
+                next = advance();
+                return current;
+            }
+        };
+        // Memory: O(1) — only holds previous key for comparison
     }
 }
 ```
@@ -651,21 +751,24 @@ public class StreamingDedupeOperator implements RowTransformer {
 ```java
 public class StreamingMergeJoinOperator {
 
-    public Flux<DataRow> join(Flux<DataRow> left, Flux<DataRow> right, String joinKey) {
+    public Iterator<DataRow> join(Iterator<DataRow> left, Iterator<DataRow> right,
+                                   String joinKey) {
         // Both inputs pre-sorted on joinKey
-        // Advance two pointers, emit matches — classic merge join
+        // Classic merge join: advance two pointers, emit matches
         // Memory: O(1) per pair
+        return new MergeJoinIterator(left, right, joinKey);
     }
 }
 ```
 
 ### Key Principles
 
-> 1. **Sort is the only truly blocking operation.** Everything else streams.
-> 2. **External merge sort** is used only for Sort — bounded memory via disk spill.
-> 3. **All other operators chain on sorted output** — O(1) memory per row.
-> 4. **The engine auto-detects**: if a Group By / Dedupe / Join sees unsorted input,
->    it inserts an external sort on the required key before the streaming operator.
+> 1. **Reactor for orchestration (.kjb), plain Java for transformation (.ktr).**
+> 2. **Sort is the only truly blocking operation.** Everything else streams via Iterator.
+> 3. **Record index sort** (lightweight) is the primary strategy — external sort is fallback only.
+> 4. **All other operators chain on sorted Iterator output** — O(1) memory per row.
+> 5. **The bridge**: `RunTransformationStep` wraps plain Java in `Mono.fromCallable()`.
+> 6. **Debugging is simple**: transformation stack traces are normal Java; only orchestration uses reactive.
 
 ---
 
@@ -679,20 +782,25 @@ public class StreamingMergeJoinOperator {
 
 ---
 
-## 11. Technology Stack
+## 12. Technology Stack
 
 | Layer | Technology |
 |---|---|
-| Runtime | Java 21+, Spring Boot 3.x, Spring WebFlux |
-| Reactive | Project Reactor (Mono/Flux) |
-| Reactive DB | R2DBC (Postgres, MySQL, Oracle) |
-| Blocking DB | HikariCP + Schedulers.boundedElastic() |
-| HTTP | Spring WebClient |
-| Messaging | Reactor Kafka / Spring Cloud Stream |
-| File I/O | Reactive Streams file reading, Apache POI (Excel) |
+| Runtime | Java 21+, Spring Boot 3.x |
+| Orchestration (.kjb) | Spring WebFlux + Project Reactor (Mono) |
+| Transformation (.ktr) | Plain Java (Iterator/Stream, no reactive types) |
+| Admin API | Spring WebFlux (REST endpoints, SSE monitoring) |
+| Database (transforms) | JDBC + HikariCP (plain, blocking — simple) |
+| Database (orchestration) | WebClient or JDBC via `Schedulers.boundedElastic()` |
+| HTTP | Spring WebClient (orchestration), `HttpURLConnection`/OkHttp (transforms) |
+| Messaging | Reactor Kafka (orchestration), Kafka client (transforms) |
+| File I/O | `BufferedReader` / `RandomAccessFile` / `MappedByteBuffer` (plain Java) |
+| Excel | Apache POI (streaming SXSSF for large files) |
 | Scripting | Groovy (via GroovyShell) |
-| Observability | Micrometer + Prometheus, OpenTelemetry, Logback structured |
-| Testing | JUnit 5, reactor-test StepVerifier, Testcontainers |
+| Observability | Micrometer + Prometheus, OpenTelemetry, SLF4J + Logback |
+| Testing (orchestration) | JUnit 5, reactor-test StepVerifier |
+| Testing (transforms) | JUnit 5, plain assertions (no StepVerifier needed) |
+| Testing (integration) | Testcontainers |
 | Build | Maven multi-module |
 | Code Gen | JavaPoet or Roaster for Java source generation |
 | Pentaho Parsing | JAXB or Jackson XML for .kjb/.ktr parsing |
