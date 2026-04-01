@@ -396,98 +396,171 @@ implemented as **streaming operators** — they just need sorted input.
 | **Append Streams** | **NO** — streaming | `Flux.concat()` — inherently streaming |
 | **Analytic Query** | **NO** — streaming | Partition + sort → sliding window over sorted partitions |
 
-### Strategy: External Sort (Disk-Backed)
+### Strategy: Lightweight Record Index Sort (Primary — No Disk I/O)
 
-For datasets that exceed a configurable memory threshold, use **external merge sort**:
+Instead of sorting full rows in memory (OOM) or spilling to disk (slow I/O),
+we use **Java Records with only the sort key(s) + file byte offset**. This gives
+us a 10-15x memory reduction, keeping the sort entirely in-heap for most datasets.
+
+#### Memory comparison (2GB CSV, ~50 columns, ~4M rows)
+
+| Approach | Per-row memory | Total (4M rows) | Disk I/O |
+|---|---|---|---|
+| Full row sort | ~500 bytes | **~2GB** (OOM) | None |
+| **Record index sort** | **~30-50 bytes** | **~120-200MB** (fits heap) | **1 extra sequential read** |
+| External disk sort | ~0 in heap | ~0 | **Heavy random I/O** |
+
+#### How it works: Two-pass sort
 
 ```
-              CSV (2GB+)
-                 │
-                 ▼
-    ┌──────────────────────┐
-    │  Chunked Reader       │  Read N rows at a time (e.g., 100K rows)
-    │  Flux<DataRow>        │  Backpressure-aware, never loads full file
-    └──────────┬───────────┘
-               │
-               ▼
-    ┌──────────────────────┐
-    │  In-Memory Sort       │  Sort each chunk in memory
-    │  per chunk            │  (100K rows fits easily in heap)
-    └──────────┬───────────┘
-               │
-               ▼
-    ┌──────────────────────┐
-    │  Spill to Temp Files  │  Write each sorted chunk to disk
-    │  (sorted runs)        │  /tmp/sort-run-001.csv, 002, 003...
-    └──────────┬───────────┘
-               │
-               ▼
-    ┌──────────────────────┐
-    │  K-Way Merge          │  Merge sorted runs using min-heap
-    │  Flux<DataRow>        │  Emits globally sorted rows as a Flux
-    │  (streaming output)   │  Memory = O(K) where K = number of runs
-    └──────────────────────┘
+Pass 1: Build sorted index (single sequential read)
+┌──────────────────────────────────────────────────────────────────────┐
+│  CSV File (2GB)                                                      │
+│  offset=0      → "Alice,Engineering,95000,NYC,..."                   │
+│  offset=1042   → "Bob,Sales,72000,Chicago,..."                       │
+│  offset=2089   → "Charlie,Engineering,88000,NYC,..."                 │
+│  ...                                                                 │
+└──────────┬───────────────────────────────────────────────────────────┘
+           │
+           ▼  Extract sort key + byte offset
+┌──────────────────────────────┐
+│  List<SortEntry> (in heap)   │
+│  record(key="Engineering",   │
+│         salary=95000,        │
+│         offset=0)            │  ← ~40 bytes per entry
+│  record(key="Sales",         │
+│         salary=72000,        │
+│         offset=1042)         │
+│  ...                         │
+│  4M entries × 40 bytes       │
+│  = ~160MB (fits in heap)     │
+└──────────┬───────────────────┘
+           │
+           ▼  Arrays.parallelSort() — in-memory, no disk
+┌──────────────────────────────┐
+│  Sorted SortEntry[]          │
+│  (sorted by key, salary)     │
+└──────────────────────────────┘
+
+Pass 2: Emit full rows in sorted order (sequential or random access read)
+┌──────────────────────────────┐
+│  For each sorted entry:      │
+│    seek(entry.offset)        │
+│    read full row             │
+│    emit as DataRow           │
+│                              │
+│  → Flux<DataRow> (sorted)    │
+└──────────────────────────────┘
 ```
 
-### Design: `ExternalSortOperator`
+#### Core design: `SortEntry` Record
 
 ```java
-public class ExternalSortOperator implements RowTransformer {
+/**
+ * Lightweight record holding ONLY the sort key(s) and the byte offset
+ * of the full row in the source CSV file. Typically 30-50 bytes per entry
+ * vs 500+ bytes for a full DataRow.
+ */
+public record SortEntry(
+    Object[] sortKeys,      // only the fields needed for comparison
+    long byteOffset         // position in source file to read full row
+) implements Comparable<SortEntry> {
+
+    @Override
+    public int compareTo(SortEntry other) {
+        // Compare sortKeys field by field using configured sort order
+    }
+}
+```
+
+#### Design: `IndexSortOperator`
+
+```java
+public class IndexSortOperator implements RowTransformer {
 
     private final List<SortField> sortFields;
-    private final int chunkSize;           // rows per chunk (default: 100_000)
-    private final long memoryThreshold;    // bytes before spilling to disk
-    private final Path spillDir;           // temp directory for sorted runs
+    private final Path sourceFile;        // original CSV file path
 
     @Override
     public Flux<DataRow> apply(Flux<DataRow> input, TransformContext context) {
+        // Pass 1: Build sorted index
         return input
-            .buffer(chunkSize)                           // collect chunks
-            .flatMapSequential(chunk -> sortAndSpill(chunk))  // sort + write to disk
-            .collectList()                               // collect run file paths
-            .flatMapMany(runs -> kWayMerge(runs));       // merge sorted runs → Flux
+            .map(row -> new SortEntry(extractSortKeys(row), row.getByteOffset()))
+            .collectList()
+            .map(entries -> {
+                // In-memory sort — lightweight records, fits in heap
+                entries.sort(Comparator.naturalOrder());
+                // Or: Arrays.parallelSort() for multi-core speedup
+                return entries;
+            })
+            // Pass 2: Emit full rows in sorted order
+            .flatMapMany(sortedEntries -> readRowsInOrder(sortedEntries));
     }
 
-    /** Sort chunk in-memory, write to temp file, return path */
-    private Mono<Path> sortAndSpill(List<DataRow> chunk) {
-        return Mono.fromCallable(() -> {
-            chunk.sort(buildComparator());
-            Path runFile = spillDir.resolve("run-" + counter.getAndIncrement() + ".dat");
-            writeToDisk(runFile, chunk);
-            return runFile;
-        }).subscribeOn(Schedulers.boundedElastic());
+    /**
+     * Reads full rows from the CSV file using the byte offsets
+     * from the sorted index. Uses RandomAccessFile for seek.
+     */
+    private Flux<DataRow> readRowsInOrder(List<SortEntry> sortedEntries) {
+        return Flux.using(
+            () -> new RandomAccessFile(sourceFile.toFile(), "r"),
+            raf -> Flux.fromIterable(sortedEntries)
+                       .map(entry -> {
+                           raf.seek(entry.byteOffset());
+                           String line = raf.readLine();
+                           return parseLine(line);
+                       }),
+            raf -> closeQuietly(raf)
+        ).subscribeOn(Schedulers.boundedElastic());
     }
+}
+```
 
-    /** K-way merge of sorted run files using a priority queue */
-    private Flux<DataRow> kWayMerge(List<Path> runFiles) {
-        return Flux.create(sink -> {
-            // Open a buffered reader per run file
-            // Priority queue of (currentRow, readerIndex) sorted by sort fields
-            // Poll min, emit, advance that reader, repeat
-            // Memory footprint: O(K) where K = number of run files
-        });
-    }
+#### Optimizing Pass 2: Sequential vs Random Access
+
+If sorted order is close to file order, sequential read is fast. If not, random
+seeks on HDD are slow. Optimization strategies:
+
+| Strategy | When to use |
+|---|---|
+| **RandomAccessFile seek** | SSD storage (seek is ~0.1ms) — works for any order |
+| **Batch + sequential re-read** | HDD storage — group offsets into page-aligned chunks, read sequentially |
+| **Memory-mapped file** | `MappedByteBuffer` via `FileChannel.map()` — OS handles caching, great for repeated access |
+
+```java
+// Memory-mapped variant (best for SSD, good for large files)
+private Flux<DataRow> readRowsInOrder(List<SortEntry> sortedEntries) {
+    return Mono.fromCallable(() -> {
+        try (FileChannel channel = FileChannel.open(sourceFile, StandardOpenOption.READ)) {
+            MappedByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
+            return sortedEntries.stream()
+                .map(entry -> readRowAt(buffer, entry.byteOffset()))
+                .toList();
+        }
+    }).flatMapMany(Flux::fromIterable)
+      .subscribeOn(Schedulers.boundedElastic());
 }
 ```
 
 ### Design: Streaming CSV Reader
 
-The CSV reader itself must be non-buffering — never load the full file:
+The CSV reader itself must be non-buffering — never load the full file.
+Critically, it must **track byte offsets** so the sort index can reference them.
 
 ```java
 public class ReactiveCsvReader {
 
     /**
      * Reads a CSV file as a Flux<DataRow>, streaming line by line.
-     * Supports files of any size — memory usage is O(1) per row.
-     * Applies backpressure: only reads as fast as downstream consumes.
+     * Each DataRow carries its byte offset in the source file,
+     * enabling the IndexSortOperator to seek back for Pass 2.
      */
     public Flux<DataRow> read(Path csvFile, CsvConfig config) {
         return Flux.using(
-            () -> Files.newBufferedReader(csvFile, config.charset()),
-            reader -> Flux.fromStream(reader.lines())
+            () -> new OffsetTrackingReader(csvFile, config.charset()),
+            reader -> Flux.fromStream(reader.linesWithOffsets())
                           .skip(config.hasHeader() ? 1 : 0)
-                          .map(line -> parseLine(line, config)),
+                          .map(offsetLine -> parseLine(offsetLine, config)),
             reader -> closeQuietly(reader)
         ).subscribeOn(Schedulers.boundedElastic());
     }
@@ -498,21 +571,30 @@ public class ReactiveCsvReader {
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `sort.chunk-size` | 100,000 rows | Tunable per job; ~50-100MB per chunk |
-| `sort.memory-threshold` | 512MB | If dataset estimate exceeds this, force external sort |
-| `sort.spill-dir` | `/tmp/etl-sort/` | Must have sufficient disk space |
-| `sort.auto-detect` | `true` | Estimate dataset size from file size; auto-switch strategy |
+| `sort.record-overhead` | 40 bytes | Estimated memory per SortEntry record |
+| `sort.max-heap-budget` | 1GB | Max heap allowed for sort index |
+| `sort.max-index-rows` | 25,000,000 | = budget / overhead; beyond this, fall back to external sort |
+| `sort.parallel-sort` | `true` | Use `Arrays.parallelSort()` for multi-core |
+| `sort.pass2-strategy` | `auto` | `mmap` for SSD, `batch-sequential` for HDD |
 | `csv.buffer-size` | 8KB | BufferedReader buffer |
 
-### Decision Logic: In-Memory vs External Sort
+### Decision Logic: Three-Tier Sort Strategy
 
 ```java
 public RowTransformer createSortStep(SortConfig config, long estimatedRows) {
-    if (estimatedRows < config.getInMemoryThreshold()) {
-        // Small dataset: simple in-memory sort (fast, no disk I/O)
-        return input -> input.collectSortedList(comparator).flatMapMany(Flux::fromIterable);
+    long indexMemory = estimatedRows * config.getRecordOverhead();
+
+    if (estimatedRows < 500_000) {
+        // Tier 1 — Small dataset: full in-memory sort (simplest, fastest)
+        return input -> input.collectSortedList(comparator)
+                             .flatMapMany(Flux::fromIterable);
+
+    } else if (indexMemory < config.getMaxHeapBudget()) {
+        // Tier 2 — Large dataset: Record index sort (no disk I/O, ~10-15x less memory)
+        return new IndexSortOperator(config);
+
     } else {
-        // Large dataset: external merge sort (bounded memory, uses disk)
+        // Tier 3 — Extreme dataset (25M+ rows): external merge sort (disk-backed fallback)
         return new ExternalSortOperator(config);
     }
 }
