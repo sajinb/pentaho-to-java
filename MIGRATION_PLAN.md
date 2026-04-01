@@ -255,9 +255,10 @@ For each Pentaho step type, we need a **CodeGenTemplate**:
 | `SWITCH_CASE` | `.groupBy(row -> classify(row))` |
 | `HTTP_CLIENT` | `webClient.get()...` |
 | `SCRIPT` | Inline Groovy/JS eval (escape hatch) |
-| `SORT_ROWS` | `.collectSortedList(comparator)` |
-| `GROUP_BY` | `.groupBy().flatMap(g -> aggregate(g))` |
-| `MERGE_JOIN` | `Flux.zip(left, right, joinFn)` |
+| `SORT_ROWS` | `ExternalSortOperator` (disk-backed, only true blocking step) |
+| `GROUP_BY` | `StreamingGroupByOperator` — `.bufferUntilChanged()` on sorted input |
+| `UNIQUE_ROWS` | `StreamingDedupeOperator` — `.distinctUntilChanged()` on sorted input |
+| `MERGE_JOIN` | `StreamingMergeJoinOperator` — two sorted streams, pointer merge |
 | `SUCCESS` | `.then()` terminal |
 | `MAIL` | Mail-sending step |
 | `ABORT` | `.error(new AbortException(...))` |
@@ -368,7 +369,7 @@ With 1,500 jobs, there will be a "long tail" of rare step types. Strategy:
 | Long tail of rare Pentaho step types | Blocks full automation | Scripting escape hatch + manual migration budget |
 | Pentaho implicit behaviors (type coercion, null handling) | Parity failures | Extensive parity testing; document known differences |
 | Reactive learning curve for team | Slow development | Training sessions; pair programming; keep blocking wrappers as escape hatch |
-| **OOM on blocking steps (Sort, GroupBy) with 2GB+ CSVs** | Job crashes, data loss | External merge sort with disk spill; memory-bounded chunked processing (see Section 10) |
+| **OOM on Sort step with 2GB+ CSVs** | Job crashes, data loss | External merge sort with disk spill; all other ops (GroupBy, Dedupe, Join) stream on sorted input (see Section 10) |
 | Performance regression | SLA violations | Benchmark early; keep JDBC option for problematic queries |
 | Scope creep (improving jobs during migration) | Timeline slippage | Strict "lift and shift" first, optimize later |
 | Connection/credential management differences | Runtime failures | Externalize all configs; use Spring profiles + vault |
@@ -379,23 +380,21 @@ With 1,500 jobs, there will be a "long tail" of rare step types. Strategy:
 
 ### The Problem
 
-Pentaho has **blocking steps** (Sort Rows, Group By, Unique Rows, etc.) that accumulate
-all records in memory before emitting output. With CSV files exceeding 2GB (tens of millions
-of rows), naive in-memory implementations will OOM in Java.
+With CSV files exceeding 2GB (tens of millions of rows), a naive `collectSortedList()`
+on 50M rows will blow the heap. However, **Sort is the ONLY truly blocking operation**.
+All other "blocking" Pentaho steps (Group By, Unique Rows, Merge Join) can be
+implemented as **streaming operators** — they just need sorted input.
 
-This is the single biggest technical risk for a reactive migration — a `Flux<DataRow>`
-that calls `.collectSortedList()` on 50M rows will blow the heap.
+### Classification: Truly Blocking vs Streaming
 
-### Blocking Steps That Need Special Handling
-
-| Pentaho Step | Why It Blocks | Java Risk |
+| Pentaho Step | Truly Blocking? | Why / How to Stream |
 |---|---|---|
-| **Sort Rows** | Must see all rows before emitting sorted output | OOM on large datasets |
-| **Group By** | Accumulates groups (especially with "all rows" mode) | OOM if many groups or large groups |
-| **Unique Rows** | Needs sorted input or hash set of seen rows | OOM on high cardinality |
-| **Merge Join** | Needs both inputs sorted | Compounds the sort problem |
-| **Append Streams** | Buffers one stream while other completes | Memory pressure |
-| **Analytic Query** | Window functions over full dataset | OOM on large windows |
+| **Sort Rows** | **YES** — the only one | Must see all rows before emitting; needs external merge sort |
+| **Group By** | **NO** — streaming | On sorted input: consecutive keys → `bufferUntilChanged()`, O(1) memory. On unsorted with low cardinality: HashMap accumulator, still O(1) relative to row count |
+| **Unique Rows** | **NO** — streaming | On sorted input: compare to previous row, O(1) memory |
+| **Merge Join** | **NO** — streaming | Two sorted streams: advance pointers, O(1) memory |
+| **Append Streams** | **NO** — streaming | `Flux.concat()` — inherently streaming |
+| **Analytic Query** | **NO** — streaming | Partition + sort → sliding window over sorted partitions |
 
 ### Strategy: External Sort (Disk-Backed)
 
@@ -519,21 +518,72 @@ public RowTransformer createSortStep(SortConfig config, long estimatedRows) {
 }
 ```
 
-### How This Applies to Other Blocking Steps
+### Streaming Operators (NOT Blocking)
 
-| Blocking Step | Large-Data Strategy |
-|---|---|
-| **Sort Rows** | External merge sort (above) |
-| **Group By (all rows)** | Pre-sort on group key via external sort, then streaming group-by on sorted input (consecutive keys) |
-| **Unique Rows (unsorted)** | External sort first, then streaming dedupe on sorted input (O(1) memory) |
-| **Merge Join** | Both inputs go through external sort on join key, then streaming merge-join |
-| **Analytic/Window** | Partition + external sort per partition, then streaming window over sorted partitions |
+These all operate on sorted input and use O(1) memory relative to total row count:
 
-### Key Principle
+#### Streaming Group By
 
-> **Never hold more than one chunk in memory.** All blocking operations are decomposed
-> into: **(1) chunk → (2) sort/process chunk → (3) spill to disk → (4) streaming merge.**
-> This keeps memory bounded regardless of input size.
+```java
+public class StreamingGroupByOperator implements RowTransformer {
+
+    @Override
+    public Flux<DataRow> apply(Flux<DataRow> sortedInput, TransformContext ctx) {
+        // Input MUST be sorted by group key (engine ensures this)
+        return sortedInput
+            .bufferUntilChanged(row -> row.get(groupKey))  // consecutive groups
+            .map(group -> aggregate(group));                // emit one row per group
+        // Memory: only holds ONE group at a time
+    }
+
+    // For unsorted input with LOW cardinality (< threshold):
+    public Flux<DataRow> applyUnsorted(Flux<DataRow> input, TransformContext ctx) {
+        Map<Object, Accumulator> accumulators = new ConcurrentHashMap<>();
+        return input
+            .doOnNext(row -> accumulators
+                .computeIfAbsent(row.get(groupKey), k -> new Accumulator())
+                .add(row))
+            .then(Mono.fromCallable(() -> accumulators.values()))
+            .flatMapMany(Flux::fromIterable)
+            .map(Accumulator::toRow);
+        // Memory: O(G) where G = number of distinct groups (must be small)
+    }
+}
+```
+
+#### Streaming Dedupe (Unique Rows)
+
+```java
+public class StreamingDedupeOperator implements RowTransformer {
+
+    @Override
+    public Flux<DataRow> apply(Flux<DataRow> sortedInput, TransformContext ctx) {
+        return sortedInput.distinctUntilChanged(row -> row.get(dedupeKey));
+        // Memory: O(1) — only holds previous row for comparison
+    }
+}
+```
+
+#### Streaming Merge Join
+
+```java
+public class StreamingMergeJoinOperator {
+
+    public Flux<DataRow> join(Flux<DataRow> left, Flux<DataRow> right, String joinKey) {
+        // Both inputs pre-sorted on joinKey
+        // Advance two pointers, emit matches — classic merge join
+        // Memory: O(1) per pair
+    }
+}
+```
+
+### Key Principles
+
+> 1. **Sort is the only truly blocking operation.** Everything else streams.
+> 2. **External merge sort** is used only for Sort — bounded memory via disk spill.
+> 3. **All other operators chain on sorted output** — O(1) memory per row.
+> 4. **The engine auto-detects**: if a Group By / Dedupe / Join sees unsorted input,
+>    it inserts an external sort on the required key before the streaming operator.
 
 ---
 
