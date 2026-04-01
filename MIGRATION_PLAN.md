@@ -97,8 +97,9 @@ pentaho-to-java/
 │   │
 │   ├── steps/                           # Built-in step implementations
 │   │   ├── db/                          # TableInput, TableOutput, DBLookup
-│   │   ├── file/                        # CsvFileInput, ExcelInput, FileOutput
+│   │   ├── file/                        # CsvFileInput (streaming), ExcelInput, FileOutput
 │   │   ├── transform/                   # SelectValues, Calculator, ScriptStep
+│   │   ├── blocking/                    # ExternalSort, StreamingGroupBy, StreamingDedupe
 │   │   ├── flow/                        # Switch/Case, Filter, Abort, Dummy
 │   │   ├── rest/                        # HttpClient step, REST input
 │   │   ├── messaging/                   # Kafka produce/consume, JMS
@@ -367,13 +368,176 @@ With 1,500 jobs, there will be a "long tail" of rare step types. Strategy:
 | Long tail of rare Pentaho step types | Blocks full automation | Scripting escape hatch + manual migration budget |
 | Pentaho implicit behaviors (type coercion, null handling) | Parity failures | Extensive parity testing; document known differences |
 | Reactive learning curve for team | Slow development | Training sessions; pair programming; keep blocking wrappers as escape hatch |
+| **OOM on blocking steps (Sort, GroupBy) with 2GB+ CSVs** | Job crashes, data loss | External merge sort with disk spill; memory-bounded chunked processing (see Section 10) |
 | Performance regression | SLA violations | Benchmark early; keep JDBC option for problematic queries |
 | Scope creep (improving jobs during migration) | Timeline slippage | Strict "lift and shift" first, optimize later |
 | Connection/credential management differences | Runtime failures | Externalize all configs; use Spring profiles + vault |
 
 ---
 
-## 10. Success Metrics
+## 10. Large File & Blocking Step Strategy (CSV 2GB+)
+
+### The Problem
+
+Pentaho has **blocking steps** (Sort Rows, Group By, Unique Rows, etc.) that accumulate
+all records in memory before emitting output. With CSV files exceeding 2GB (tens of millions
+of rows), naive in-memory implementations will OOM in Java.
+
+This is the single biggest technical risk for a reactive migration — a `Flux<DataRow>`
+that calls `.collectSortedList()` on 50M rows will blow the heap.
+
+### Blocking Steps That Need Special Handling
+
+| Pentaho Step | Why It Blocks | Java Risk |
+|---|---|---|
+| **Sort Rows** | Must see all rows before emitting sorted output | OOM on large datasets |
+| **Group By** | Accumulates groups (especially with "all rows" mode) | OOM if many groups or large groups |
+| **Unique Rows** | Needs sorted input or hash set of seen rows | OOM on high cardinality |
+| **Merge Join** | Needs both inputs sorted | Compounds the sort problem |
+| **Append Streams** | Buffers one stream while other completes | Memory pressure |
+| **Analytic Query** | Window functions over full dataset | OOM on large windows |
+
+### Strategy: External Sort (Disk-Backed)
+
+For datasets that exceed a configurable memory threshold, use **external merge sort**:
+
+```
+              CSV (2GB+)
+                 │
+                 ▼
+    ┌──────────────────────┐
+    │  Chunked Reader       │  Read N rows at a time (e.g., 100K rows)
+    │  Flux<DataRow>        │  Backpressure-aware, never loads full file
+    └──────────┬───────────┘
+               │
+               ▼
+    ┌──────────────────────┐
+    │  In-Memory Sort       │  Sort each chunk in memory
+    │  per chunk            │  (100K rows fits easily in heap)
+    └──────────┬───────────┘
+               │
+               ▼
+    ┌──────────────────────┐
+    │  Spill to Temp Files  │  Write each sorted chunk to disk
+    │  (sorted runs)        │  /tmp/sort-run-001.csv, 002, 003...
+    └──────────┬───────────┘
+               │
+               ▼
+    ┌──────────────────────┐
+    │  K-Way Merge          │  Merge sorted runs using min-heap
+    │  Flux<DataRow>        │  Emits globally sorted rows as a Flux
+    │  (streaming output)   │  Memory = O(K) where K = number of runs
+    └──────────────────────┘
+```
+
+### Design: `ExternalSortOperator`
+
+```java
+public class ExternalSortOperator implements RowTransformer {
+
+    private final List<SortField> sortFields;
+    private final int chunkSize;           // rows per chunk (default: 100_000)
+    private final long memoryThreshold;    // bytes before spilling to disk
+    private final Path spillDir;           // temp directory for sorted runs
+
+    @Override
+    public Flux<DataRow> apply(Flux<DataRow> input, TransformContext context) {
+        return input
+            .buffer(chunkSize)                           // collect chunks
+            .flatMapSequential(chunk -> sortAndSpill(chunk))  // sort + write to disk
+            .collectList()                               // collect run file paths
+            .flatMapMany(runs -> kWayMerge(runs));       // merge sorted runs → Flux
+    }
+
+    /** Sort chunk in-memory, write to temp file, return path */
+    private Mono<Path> sortAndSpill(List<DataRow> chunk) {
+        return Mono.fromCallable(() -> {
+            chunk.sort(buildComparator());
+            Path runFile = spillDir.resolve("run-" + counter.getAndIncrement() + ".dat");
+            writeToDisk(runFile, chunk);
+            return runFile;
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /** K-way merge of sorted run files using a priority queue */
+    private Flux<DataRow> kWayMerge(List<Path> runFiles) {
+        return Flux.create(sink -> {
+            // Open a buffered reader per run file
+            // Priority queue of (currentRow, readerIndex) sorted by sort fields
+            // Poll min, emit, advance that reader, repeat
+            // Memory footprint: O(K) where K = number of run files
+        });
+    }
+}
+```
+
+### Design: Streaming CSV Reader
+
+The CSV reader itself must be non-buffering — never load the full file:
+
+```java
+public class ReactiveCsvReader {
+
+    /**
+     * Reads a CSV file as a Flux<DataRow>, streaming line by line.
+     * Supports files of any size — memory usage is O(1) per row.
+     * Applies backpressure: only reads as fast as downstream consumes.
+     */
+    public Flux<DataRow> read(Path csvFile, CsvConfig config) {
+        return Flux.using(
+            () -> Files.newBufferedReader(csvFile, config.charset()),
+            reader -> Flux.fromStream(reader.lines())
+                          .skip(config.hasHeader() ? 1 : 0)
+                          .map(line -> parseLine(line, config)),
+            reader -> closeQuietly(reader)
+        ).subscribeOn(Schedulers.boundedElastic());
+    }
+}
+```
+
+### Memory Budget & Thresholds
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `sort.chunk-size` | 100,000 rows | Tunable per job; ~50-100MB per chunk |
+| `sort.memory-threshold` | 512MB | If dataset estimate exceeds this, force external sort |
+| `sort.spill-dir` | `/tmp/etl-sort/` | Must have sufficient disk space |
+| `sort.auto-detect` | `true` | Estimate dataset size from file size; auto-switch strategy |
+| `csv.buffer-size` | 8KB | BufferedReader buffer |
+
+### Decision Logic: In-Memory vs External Sort
+
+```java
+public RowTransformer createSortStep(SortConfig config, long estimatedRows) {
+    if (estimatedRows < config.getInMemoryThreshold()) {
+        // Small dataset: simple in-memory sort (fast, no disk I/O)
+        return input -> input.collectSortedList(comparator).flatMapMany(Flux::fromIterable);
+    } else {
+        // Large dataset: external merge sort (bounded memory, uses disk)
+        return new ExternalSortOperator(config);
+    }
+}
+```
+
+### How This Applies to Other Blocking Steps
+
+| Blocking Step | Large-Data Strategy |
+|---|---|
+| **Sort Rows** | External merge sort (above) |
+| **Group By (all rows)** | Pre-sort on group key via external sort, then streaming group-by on sorted input (consecutive keys) |
+| **Unique Rows (unsorted)** | External sort first, then streaming dedupe on sorted input (O(1) memory) |
+| **Merge Join** | Both inputs go through external sort on join key, then streaming merge-join |
+| **Analytic/Window** | Partition + external sort per partition, then streaming window over sorted partitions |
+
+### Key Principle
+
+> **Never hold more than one chunk in memory.** All blocking operations are decomposed
+> into: **(1) chunk → (2) sort/process chunk → (3) spill to disk → (4) streaming merge.**
+> This keeps memory bounded regardless of input size.
+
+---
+
+## 11. Success Metrics
 
 - **Automation rate**: % of jobs fully auto-generated (target: >85%)
 - **Parity pass rate**: % of jobs producing identical output to Pentaho (target: >99%)
